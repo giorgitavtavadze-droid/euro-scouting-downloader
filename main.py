@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import tempfile
 import subprocess
 from typing import Any, Dict, List
@@ -10,7 +11,7 @@ from pydantic import BaseModel
 from google import genai
 from supabase import create_client
 
-app = FastAPI(title="Euro Scouting Worker", version="3.1")
+app = FastAPI(title="Euro Scouting Worker", version="3.2")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -27,7 +28,7 @@ class DriveJobRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "euro-scouting-worker-v3.1"}
+    return {"status": "ok", "service": "euro-scouting-worker-v3.2"}
 
 
 @app.post("/process-drive-job")
@@ -50,15 +51,7 @@ def update_job(job_id: str, data: Dict[str, Any]):
     supabase.table("analysis_jobs").update(data).eq("id", job_id).execute()
 
 
-def get_drive_download_url(file_id: str) -> str:
-    return f"https://drive.google.com/uc?id={file_id}"
-
-
 def split_drive_video_directly(file_id: str, output_dir: str, segment_seconds: int = 600) -> List[str]:
-    """
-    Downloads from Google Drive with gdown into ffmpeg-readable stream-like temp file is unreliable on Render Free.
-    So this version uses gdown cached direct handling but immediately segments with ffmpeg and keeps only chunks.
-    """
     source_path = os.path.join(output_dir, "_source_tmp.mp4")
 
     print("Downloading source video...", flush=True)
@@ -105,10 +98,33 @@ def split_drive_video_directly(file_id: str, output_dir: str, segment_seconds: i
     return chunks
 
 
+def wait_for_gemini_file_active(uploaded_file: Any, timeout_seconds: int = 600):
+    print("Waiting for Gemini file to become ACTIVE...", flush=True)
+
+    started_at = time.time()
+
+    while time.time() - started_at < timeout_seconds:
+        file_state = genai_client.files.get(name=uploaded_file.name)
+        state_name = getattr(file_state.state, "name", str(file_state.state))
+
+        print(f"Gemini file state: {state_name}", flush=True)
+
+        if state_name == "ACTIVE":
+            return file_state
+
+        if state_name == "FAILED":
+            raise RuntimeError("Gemini file processing failed")
+
+        time.sleep(5)
+
+    raise RuntimeError("Gemini file did not become ACTIVE in time")
+
+
 def analyze_chunk(chunk_path: str, chunk_index: int):
     print(f"Uploading chunk {chunk_index} to Gemini...", flush=True)
 
     uploaded_file = genai_client.files.upload(file=chunk_path)
+    uploaded_file = wait_for_gemini_file_active(uploaded_file)
 
     prompt = f"""
 You are a professional 7v7 football video analyst.
