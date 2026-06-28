@@ -2,21 +2,18 @@ import os
 import tempfile
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from yt_dlp import YoutubeDL
 from google import genai
+import gdown
 
 app = FastAPI()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    client = None
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
-class ProcessVideoRequest(BaseModel):
-    youtube_url: str
+class DriveJobRequest(BaseModel):
+    job_id: str
+    source_file_id: str
 
 
 @app.get("/")
@@ -24,34 +21,24 @@ def health_check():
     return {"status": "ok", "service": "euro-scouting-downloader"}
 
 
-@app.post("/process-video")
-def process_video(req: ProcessVideoRequest):
+@app.post("/process-drive-job")
+def process_drive_job(req: DriveJobRequest):
     if not client:
         raise HTTPException(status_code=500, detail="Missing GEMINI_API_KEY")
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_template = os.path.join(tmpdir, "video.%(ext)s")
+            file_path = os.path.join(tmpdir, "video.mp4")
 
-            ydl_opts = {
-                "format": "best[ext=mp4]/best",
-                "outtmpl": output_template,
-                "quiet": True,
-                "noplaylist": True,
-                "max_filesize": 2 * 1024 * 1024 * 1024
-            }
-
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(req.youtube_url, download=True)
-                file_path = ydl.prepare_filename(info)
+            drive_url = f"https://drive.google.com/uc?id={req.source_file_id}"
+            gdown.download(drive_url, file_path, quiet=False)
 
             uploaded_file = client.files.upload(file=file_path)
 
             return {
                 "status": "success",
-                "youtube_url": req.youtube_url,
-                "title": info.get("title"),
-                "duration_seconds": info.get("duration"),
+                "job_id": req.job_id,
+                "source_file_id": req.source_file_id,
                 "file_uri": uploaded_file.uri,
                 "file_name": uploaded_file.name,
                 "mime_type": uploaded_file.mime_type
