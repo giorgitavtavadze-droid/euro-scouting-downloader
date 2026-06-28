@@ -4,3 +4,5 @@ yt-dlp
 google-genai
 python-dotenv
 gdown
+requests
+supabase
