@@ -3,3 +3,4 @@ uvicorn[standard]
 yt-dlp
 google-genai
 python-dotenv
+gdown
