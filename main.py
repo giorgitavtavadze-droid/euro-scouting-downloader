@@ -1,5 +1,4 @@
 import os
-import time
 import json
 import tempfile
 import subprocess
@@ -11,7 +10,7 @@ from pydantic import BaseModel
 from google import genai
 from supabase import create_client
 
-app = FastAPI(title="Euro Scouting Worker", version="3.0")
+app = FastAPI(title="Euro Scouting Worker", version="3.1")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -28,7 +27,7 @@ class DriveJobRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "euro-scouting-worker-v3"}
+    return {"status": "ok", "service": "euro-scouting-worker-v3.1"}
 
 
 @app.post("/process-drive-job")
@@ -51,19 +50,33 @@ def update_job(job_id: str, data: Dict[str, Any]):
     supabase.table("analysis_jobs").update(data).eq("id", job_id).execute()
 
 
-def download_drive_file(file_id: str, output_path: str):
-    result = gdown.download(id=file_id, output=output_path, quiet=False)
+def get_drive_download_url(file_id: str) -> str:
+    return f"https://drive.google.com/uc?id={file_id}"
 
-    if not result or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+
+def split_drive_video_directly(file_id: str, output_dir: str, segment_seconds: int = 600) -> List[str]:
+    """
+    Downloads from Google Drive with gdown into ffmpeg-readable stream-like temp file is unreliable on Render Free.
+    So this version uses gdown cached direct handling but immediately segments with ffmpeg and keeps only chunks.
+    """
+    source_path = os.path.join(output_dir, "_source_tmp.mp4")
+
+    print("Downloading source video...", flush=True)
+    result = gdown.download(id=file_id, output=source_path, quiet=False)
+
+    if not result or not os.path.exists(source_path) or os.path.getsize(source_path) == 0:
         raise RuntimeError("Google Drive download failed. Check sharing: Anyone with the link -> Viewer.")
 
+    print(f"Downloaded file size: {os.path.getsize(source_path)} bytes", flush=True)
 
-def split_video(input_path: str, output_dir: str, segment_seconds: int = 600) -> List[str]:
     output_pattern = os.path.join(output_dir, "chunk_%03d.mp4")
+
+    print("Splitting video with ffmpeg...", flush=True)
 
     cmd = [
         "ffmpeg",
-        "-i", input_path,
+        "-y",
+        "-i", source_path,
         "-c", "copy",
         "-map", "0",
         "-f", "segment",
@@ -74,19 +87,27 @@ def split_video(input_path: str, output_dir: str, segment_seconds: int = 600) ->
 
     subprocess.run(cmd, check=True)
 
+    try:
+        os.remove(source_path)
+    except Exception:
+        pass
+
     chunks = sorted(
         os.path.join(output_dir, f)
         for f in os.listdir(output_dir)
-        if f.endswith(".mp4")
+        if f.startswith("chunk_") and f.endswith(".mp4")
     )
 
     if not chunks:
         raise RuntimeError("No chunks were created by ffmpeg.")
 
+    print(f"Created {len(chunks)} chunks", flush=True)
     return chunks
 
 
 def analyze_chunk(chunk_path: str, chunk_index: int):
+    print(f"Uploading chunk {chunk_index} to Gemini...", flush=True)
+
     uploaded_file = genai_client.files.upload(file=chunk_path)
 
     prompt = f"""
@@ -135,23 +156,27 @@ JSON:
 
 def run_job(job_id: str, source_file_id: str):
     try:
+        print(f"Job started: {job_id}", flush=True)
+
         update_job(job_id, {
             "status": "running",
             "error_message": None
         })
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            video_path = os.path.join(tmpdir, "source_video.mp4")
-            chunks_dir = os.path.join(tmpdir, "chunks")
-            os.makedirs(chunks_dir, exist_ok=True)
-
-            download_drive_file(source_file_id, video_path)
-            chunks = split_video(video_path, chunks_dir, segment_seconds=600)
+            chunks = split_drive_video_directly(source_file_id, tmpdir, segment_seconds=600)
 
             chunk_results = []
+
             for i, chunk in enumerate(chunks, start=1):
+                print(f"Analyzing chunk {i}/{len(chunks)}", flush=True)
                 result = analyze_chunk(chunk, i)
                 chunk_results.append(result)
+
+                try:
+                    os.remove(chunk)
+                except Exception:
+                    pass
 
             update_job(job_id, {
                 "status": "completed",
@@ -165,7 +190,10 @@ def run_job(job_id: str, source_file_id: str):
                 }
             })
 
+        print(f"Job completed: {job_id}", flush=True)
+
     except Exception as e:
+        print(f"Job failed: {job_id} | {str(e)}", flush=True)
         update_job(job_id, {
             "status": "failed",
             "error_message": str(e)
