@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import gc
 import tempfile
 import subprocess
 from typing import Any, Dict, List
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 from google import genai
 from supabase import create_client
 
-app = FastAPI(title="Euro Scouting Worker", version="3.2")
+app = FastAPI(title="Euro Scouting Worker", version="3.3-low-memory")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -28,7 +29,7 @@ class DriveJobRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "euro-scouting-worker-v3.2"}
+    return {"status": "ok", "service": "euro-scouting-worker-v3.3-low-memory"}
 
 
 @app.post("/process-drive-job")
@@ -51,7 +52,7 @@ def update_job(job_id: str, data: Dict[str, Any]):
     supabase.table("analysis_jobs").update(data).eq("id", job_id).execute()
 
 
-def split_drive_video_directly(file_id: str, output_dir: str, segment_seconds: int = 600) -> List[str]:
+def split_drive_video(file_id: str, output_dir: str, segment_seconds: int = 180) -> List[str]:
     source_path = os.path.join(output_dir, "_source_tmp.mp4")
 
     print("Downloading source video...", flush=True)
@@ -64,14 +65,15 @@ def split_drive_video_directly(file_id: str, output_dir: str, segment_seconds: i
 
     output_pattern = os.path.join(output_dir, "chunk_%03d.mp4")
 
-    print("Splitting video with ffmpeg...", flush=True)
+    print("Splitting video into small chunks...", flush=True)
 
     cmd = [
         "ffmpeg",
         "-y",
         "-i", source_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
         "-c", "copy",
-        "-map", "0",
         "-f", "segment",
         "-segment_time", str(segment_seconds),
         "-reset_timestamps", "1",
@@ -84,6 +86,8 @@ def split_drive_video_directly(file_id: str, output_dir: str, segment_seconds: i
         os.remove(source_path)
     except Exception:
         pass
+
+    gc.collect()
 
     chunks = sorted(
         os.path.join(output_dir, f)
@@ -120,16 +124,28 @@ def wait_for_gemini_file_active(uploaded_file: Any, timeout_seconds: int = 600):
     raise RuntimeError("Gemini file did not become ACTIVE in time")
 
 
-def analyze_chunk(chunk_path: str, chunk_index: int):
-    print(f"Uploading chunk {chunk_index} to Gemini...", flush=True)
+def delete_gemini_file(uploaded_file: Any):
+    try:
+        if uploaded_file and getattr(uploaded_file, "name", None):
+            genai_client.files.delete(name=uploaded_file.name)
+            print("Deleted Gemini uploaded file", flush=True)
+    except Exception as e:
+        print(f"Could not delete Gemini file: {e}", flush=True)
 
-    uploaded_file = genai_client.files.upload(file=chunk_path)
-    uploaded_file = wait_for_gemini_file_active(uploaded_file)
 
-    prompt = f"""
+def analyze_chunk(chunk_path: str, chunk_index: int, chunks_count: int):
+    uploaded_file = None
+
+    try:
+        print(f"Uploading chunk {chunk_index}/{chunks_count} to Gemini...", flush=True)
+
+        uploaded_file = genai_client.files.upload(file=chunk_path)
+        uploaded_file = wait_for_gemini_file_active(uploaded_file)
+
+        prompt = f"""
 You are a professional 7v7 football video analyst.
 
-Analyze chunk #{chunk_index} of a football match video.
+Analyze chunk {chunk_index} of {chunks_count} from a 7v7 football match.
 
 Return Georgian JSON only.
 
@@ -150,6 +166,7 @@ If something is unclear, say confidence is low.
 JSON:
 {{
   "chunk_index": {chunk_index},
+  "chunks_count": {chunks_count},
   "summary": "",
   "key_events": [],
   "player_observations": [],
@@ -158,47 +175,78 @@ JSON:
 }}
 """
 
-    response = genai_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[prompt, uploaded_file]
-    )
+        response = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt, uploaded_file]
+        )
 
-    return {
-        "chunk_index": chunk_index,
-        "gemini_file_uri": getattr(uploaded_file, "uri", None),
-        "text": getattr(response, "text", str(response))
-    }
+        text = getattr(response, "text", str(response))
+
+        return {
+            "chunk_index": chunk_index,
+            "gemini_file_uri": getattr(uploaded_file, "uri", None),
+            "text": text
+        }
+
+    finally:
+        delete_gemini_file(uploaded_file)
+
+        try:
+            os.remove(chunk_path)
+        except Exception:
+            pass
+
+        del uploaded_file
+        gc.collect()
 
 
 def run_job(job_id: str, source_file_id: str):
+    chunk_results = []
+
     try:
         print(f"Job started: {job_id}", flush=True)
 
         update_job(job_id, {
             "status": "running",
-            "error_message": None
+            "error_message": None,
+            "result_json": {
+                "status": "running",
+                "chunks": []
+            }
         })
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            chunks = split_drive_video_directly(source_file_id, tmpdir, segment_seconds=600)
-
-            chunk_results = []
+            chunks = split_drive_video(source_file_id, tmpdir, segment_seconds=180)
+            chunks_count = len(chunks)
 
             for i, chunk in enumerate(chunks, start=1):
-                print(f"Analyzing chunk {i}/{len(chunks)}", flush=True)
-                result = analyze_chunk(chunk, i)
+                print(f"Analyzing chunk {i}/{chunks_count}", flush=True)
+
+                result = analyze_chunk(chunk, i, chunks_count)
                 chunk_results.append(result)
 
-                try:
-                    os.remove(chunk)
-                except Exception:
-                    pass
+                update_job(job_id, {
+                    "status": "running",
+                    "result_json": {
+                        "status": "running",
+                        "chunks_count": chunks_count,
+                        "processed_chunks": i,
+                        "chunks": chunk_results
+                    },
+                    "raw_response": {
+                        "text": json.dumps(chunk_results, ensure_ascii=False)
+                    }
+                })
+
+                gc.collect()
 
             update_job(job_id, {
                 "status": "completed",
                 "ai_model": "gemini-2.5-flash",
                 "result_json": {
-                    "chunks_count": len(chunk_results),
+                    "status": "completed",
+                    "chunks_count": chunks_count,
+                    "processed_chunks": chunks_count,
                     "chunks": chunk_results
                 },
                 "raw_response": {
@@ -210,7 +258,15 @@ def run_job(job_id: str, source_file_id: str):
 
     except Exception as e:
         print(f"Job failed: {job_id} | {str(e)}", flush=True)
+
         update_job(job_id, {
             "status": "failed",
-            "error_message": str(e)
+            "error_message": str(e),
+            "result_json": {
+                "status": "failed",
+                "partial_chunks": chunk_results
+            }
         })
+
+    finally:
+        gc.collect()
